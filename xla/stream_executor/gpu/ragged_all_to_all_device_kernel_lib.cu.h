@@ -31,6 +31,14 @@ struct alignas(kSize) DeviceVec {
 
 #if NCCL_VERSION_CODE >= 22900
 
+// Flag cells for the CTA-0-delegated LSA barrier (see the kernel's else
+// branch). Launches of this kernel on one device are stream-serialized, so a
+// plain flag + done-counter pair needs no epoch: CTA 0 resets both to zero
+// before it runs the exit barrier, and the next launch cannot start until the
+// current one completes.
+static __device__ unsigned xla_ragged_dk_entry_flag = 0;
+static __device__ unsigned xla_ragged_dk_done_count = 0;
+
 template <int64_t kVectorSize>
 struct RaggedAllToAllUpdateMetadata {
   int peer;
@@ -197,17 +205,61 @@ __global__ void __launch_bounds__(128) RaggedAllToAllDeviceKernelImpl(
     bar.sync(ncclCoopCta(), ::cuda::memory_order_release,
              ncclGinFenceLevel::Relaxed);
   } else {
-    ncclLsaBarrierSession<ncclCoopCta> bar{ncclCoopCta(), dev_comm,
-                                           ncclTeamTagLsa{}, blockIdx.x};
-    bar.sync(ncclCoopCta(), ::cuda::memory_order_relaxed);
+    // Only CTA 0 participates in the cross-rank LSA barrier; the rest of the
+    // grid synchronizes with it through device-scope flags. This removes the
+    // per-CTA barrier slots whose cost scales with grid size x ranks, so the
+    // copy grid can grow past the point where per-CTA sessions win it back.
+    if (blockIdx.x == 0) {
+      ncclLsaBarrierSession<ncclCoopCta> bar{ncclCoopCta(), dev_comm,
+                                             ncclTeamTagLsa{}, /*index=*/0};
+      bar.sync(ncclCoopCta(), ::cuda::memory_order_relaxed);
+      if (threadIdx.x == 0) {
+        __threadfence();
+        atomicExch(&xla_ragged_dk_entry_flag, 1u);
+      }
+      __syncthreads();
 
-    RaggedAllToAllCopy<kVectorSize>(
-        send_win, recv_win, input_offsets_ptr, send_sizes_ptr,
-        output_offsets_ptr, num_updates_per_replica, num_row_elements,
-        input_buffer_offset_bytes, output_buffer_offset_bytes, start_lsa,
-        lsa_size, num_ranks, /*gin=*/nullptr, world, /*signal_index=*/0);
+      RaggedAllToAllCopy<kVectorSize>(
+          send_win, recv_win, input_offsets_ptr, send_sizes_ptr,
+          output_offsets_ptr, num_updates_per_replica, num_row_elements,
+          input_buffer_offset_bytes, output_buffer_offset_bytes, start_lsa,
+          lsa_size, num_ranks, /*gin=*/nullptr, world, /*signal_index=*/0);
 
-    bar.sync(ncclCoopCta(), ::cuda::memory_order_release);
+      __threadfence_system();
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        while (atomicAdd(&xla_ragged_dk_done_count, 0u) != gridDim.x - 1) {
+        }
+        // Reset for the next launch before releasing the exit barrier; the
+        // stream serializes launches, so no other grid can observe the
+        // intermediate state.
+        atomicExch(&xla_ragged_dk_entry_flag, 0u);
+        atomicExch(&xla_ragged_dk_done_count, 0u);
+      }
+      __syncthreads();
+      // Order the other CTAs' peer-buffer writes (observed via done_count)
+      // before the release barrier's cross-rank signal.
+      __threadfence_system();
+      bar.sync(ncclCoopCta(), ::cuda::memory_order_release);
+    } else {
+      if (threadIdx.x == 0) {
+        while (atomicAdd(&xla_ragged_dk_entry_flag, 0u) == 0u) {
+        }
+      }
+      __syncthreads();
+
+      RaggedAllToAllCopy<kVectorSize>(
+          send_win, recv_win, input_offsets_ptr, send_sizes_ptr,
+          output_offsets_ptr, num_updates_per_replica, num_row_elements,
+          input_buffer_offset_bytes, output_buffer_offset_bytes, start_lsa,
+          lsa_size, num_ranks, /*gin=*/nullptr, world, /*signal_index=*/0);
+
+      __threadfence_system();
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        atomicAdd(&xla_ragged_dk_done_count, 1u);
+      }
+    }
   }
 #endif  // __CUDA_ARCH__ >= 600
 }
