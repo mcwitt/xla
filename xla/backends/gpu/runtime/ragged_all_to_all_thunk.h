@@ -184,20 +184,25 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // Number of per-CTA barrier/signal slots reserved when creating the device
   // communicator. The kernel indexes its cooperative barrier by blockIdx.x, so
   // registration must cover the largest grid we might launch, which is
-  // bounded by the executor's SM count. Callers pass the SM count from
+  // bounded by kGridSmMultiplier CTAs per SM. Callers pass the SM count from
   // se::DeviceDescription::core_count(); all participating ranks are expected
   // to be homogeneous so every rank arrives at the same value.
   static int32_t device_kernel_barrier_count(int core_count) {
-    return std::max<int32_t>(core_count, kMinDeviceKernelCtaCount);
+    return std::max<int32_t>(kGridSmMultiplier * core_count,
+                             kMinDeviceKernelCtaCount);
   }
 
-  // Launch grid for the device kernel. Sized to saturate the SMs (grid =
-  // ctas_per_update * num_active_updates, chosen so grid <= sm_cap and evenly
-  // divides `total_lsa_updates` in RaggedAllToAllCopy). All ranks launch the
-  // same grid, which the cross-rank cooperative barriers require.
+  // Launch grid for the device kernel. Sized to keep many concurrent CTAs on
+  // each peer's copy stream (grid = ctas_per_update * num_active_updates,
+  // chosen so grid <= sm_cap and evenly divides `total_lsa_updates` in
+  // RaggedAllToAllCopy). All ranks launch the same grid, which the cross-rank
+  // cooperative barriers require: every CTA must be resident simultaneously,
+  // so the cap is kGridSmMultiplier CTAs of 128 threads per SM (1024
+  // threads/SM, well inside Hopper/Blackwell residency limits).
   static int32_t DeviceKernelLaunchCtaCount(int core_count,
                                             int64_t num_active_updates) {
-    const int64_t sm_cap = std::max<int64_t>(1, core_count);
+    const int64_t sm_cap =
+        std::max<int64_t>(1, kGridSmMultiplier * static_cast<int64_t>(core_count));
     const int64_t updates = std::max<int64_t>(1, num_active_updates);
     const int64_t ctas_per_update = std::max<int64_t>(1, sm_cap / updates);
     const int64_t grid = ctas_per_update * updates;
@@ -256,6 +261,11 @@ class RaggedAllToAllThunk : public CollectiveThunk {
   // The upper bound is derived from the executor's SM count at Prepare /
   // Initialize / Run time via device_kernel_barrier_count().
   static constexpr int32_t kMinDeviceKernelCtaCount = 8;
+  // Resident CTAs per SM for the device kernel's cooperative grid. With
+  // 128-thread CTAs this is 1024 threads/SM; the in-kernel LSA barriers
+  // require the whole grid resident, so the product must stay within the
+  // architecture's thread- and CTA-residency limits.
+  static constexpr int32_t kGridSmMultiplier = 8;
 
   mutable absl::Mutex mutex_;
   absl::flat_hash_map<se::StreamExecutor*,

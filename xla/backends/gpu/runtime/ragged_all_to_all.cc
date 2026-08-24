@@ -249,7 +249,12 @@ absl::Status RunDeviceRaggedAllToAllKernel(
     int64_t cta_count, int64_t input_buffer_offset_bytes,
     int64_t output_buffer_offset_bytes) {
   se::StreamExecutor* executor = stream->parent();
-  static constexpr size_t kThreadsPerCta = 512;
+  // 128-thread CTAs (with the 8x-SM grid in DeviceKernelLaunchCtaCount) put
+  // more independent CTAs on each peer's copy stream. The copies are
+  // latency-bound peer stores, so throughput scales with concurrent CTAs per
+  // peer rather than threads per CTA; 512-thread CTAs at a 1x-SM grid leave
+  // the kernel at roughly half of NVLink line rate on GB200 NVL72.
+  static constexpr size_t kThreadsPerCta = 128;
 
   int64_t num_vectorized_row_elements = num_row_elements;
   int64_t vector_size_bytes = xla::primitive_util::ByteWidth(element_type);
