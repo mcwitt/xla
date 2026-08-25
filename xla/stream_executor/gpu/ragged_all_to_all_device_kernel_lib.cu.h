@@ -210,6 +210,7 @@ __global__ void __launch_bounds__(128) RaggedAllToAllDeviceKernelImpl(
     // per-CTA barrier slots whose cost scales with grid size x ranks, so the
     // copy grid can grow past the point where per-CTA sessions win it back.
     if (blockIdx.x == 0) {
+      const long long t0 = clock64();
       ncclLsaBarrierSession<ncclCoopCta> bar{ncclCoopCta(), dev_comm,
                                              ncclTeamTagLsa{}, /*index=*/0};
       bar.sync(ncclCoopCta(), ::cuda::memory_order_relaxed);
@@ -218,6 +219,7 @@ __global__ void __launch_bounds__(128) RaggedAllToAllDeviceKernelImpl(
         atomicExch(&xla_ragged_dk_entry_flag, 1u);
       }
       __syncthreads();
+      const long long t1 = clock64();
 
       RaggedAllToAllCopy<kVectorSize>(
           send_win, recv_win, input_offsets_ptr, send_sizes_ptr,
@@ -227,8 +229,14 @@ __global__ void __launch_bounds__(128) RaggedAllToAllDeviceKernelImpl(
 
       __threadfence_system();
       __syncthreads();
+      const long long t2 = clock64();
       if (threadIdx.x == 0) {
         while (atomicAdd(&xla_ragged_dk_done_count, 0u) != gridDim.x - 1) {
+        }
+        const long long t3 = clock64();
+        if (world.rank == 0) {
+          printf("DKTIME entry=%lld copy0=%lld donewait=%lld cycles\n",
+                 t1 - t0, t2 - t1, t3 - t2);
         }
         // Reset for the next launch before releasing the exit barrier; the
         // stream serializes launches, so no other grid can observe the
